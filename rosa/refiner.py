@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 import math
+from typing import Callable
 
 import torch
 from torch import Tensor, nn

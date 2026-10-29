@@ -14,7 +14,22 @@ import statistics
 import time
 import warnings
 
+# The released configs enable deterministic CUDA algorithms.  cuBLAS requires
+# this workspace contract to be present before its first handle is created;
+# otherwise the first matrix contraction fails at runtime instead of merely
+# becoming non-deterministic.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
+# The existing OpenMMLab environment contains scikit-learn 0.19, whose import
+# still references NumPy's removed aliases. Keep this launcher compatible
+# without changing the shared environment used by the LiDAR pipeline.
+if "float" not in np.__dict__:
+    np.float = float  # type: ignore[attr-defined]
+if "int" not in np.__dict__:
+    np.int = int  # type: ignore[attr-defined]
+if "bool" not in np.__dict__:
+    np.bool = bool  # type: ignore[attr-defined]
 import torch
 from mmengine.config import Config, DictAction
 from mmengine.hooks import Hook
@@ -332,10 +347,34 @@ def train(args: argparse.Namespace, config: Config) -> None:
         config.resume = True
         config.load_from = None if args.resume == "auto" else args.resume
     if args.amp:
-        if config.optim_wrapper.type != "OptimWrapper":
-            raise ValueError("--amp requires a plain OptimWrapper")
-        config.optim_wrapper.type = "AmpOptimWrapper"
-        config.optim_wrapper.setdefault("loss_scale", "dynamic")
+        amp_wrapper_types = {
+            "OptimWrapper": "AmpOptimWrapper",
+            "ROSAPairedClipOptimWrapper": "ROSAPairedAmpOptimWrapper",
+        }
+        wrapper_type = config.optim_wrapper.type
+        if wrapper_type in amp_wrapper_types:
+            config.optim_wrapper.type = amp_wrapper_types[wrapper_type]
+        elif wrapper_type not in {
+            "AmpOptimWrapper",
+            "ROSAPairedAmpOptimWrapper",
+        }:
+            supported = ", ".join(sorted(amp_wrapper_types))
+            raise ValueError(
+                f"--amp cannot convert optimizer wrapper {wrapper_type!r}; "
+                f"supported FP32 wrappers: {supported}"
+            )
+        # The V99 fisheye head can overflow GradScaler's 65536 default (and
+        # larger low scales) on its first denoising batch, while its unscaled
+        # FP16 gradients are finite. Keep dynamic growth/backoff, but begin at
+        # unit scale. In AMP mode GradScaler owns non-finite handling
+        # (skip + backoff), so gradient clipping must not raise first.
+        config.optim_wrapper.setdefault(
+            "loss_scale",
+            dict(init_scale=1.0, growth_interval=2000),
+        )
+        clip_grad = config.optim_wrapper.get("clip_grad")
+        if clip_grad is not None:
+            clip_grad["error_if_nonfinite"] = False
     runner = Runner.from_cfg(config)
     provenance = None
     if getattr(runner, "rank", 0) == 0:

@@ -12,6 +12,12 @@ import argparse
 
 import mmengine
 import numpy as np
+# The deployment environment carries the original scikit-learn used by the
+# ROSA release together with NumPy >=1.24, which removed these legacy aliases.
+if not hasattr(np, "float"):
+    np.float = float  # type: ignore[attr-defined]
+if not hasattr(np, "int"):
+    np.int = int  # type: ignore[attr-defined]
 from sklearn.cluster import KMeans
 
 
@@ -27,12 +33,23 @@ def main() -> None:
     centers = []
     sizes = []
     for info in data["data_list"]:
-        for instance in info.get("instances", ()):
-            box = instance["bbox_3d"]
-            if int(instance["bbox_label_3d"]) < 0:
-                continue
-            centers.append(box[:3])
-            sizes.append(box[3:6])
+        instances = info.get("instances", ())
+        if instances:
+            for instance in instances:
+                box = instance["bbox_3d"]
+                if int(instance["bbox_label_3d"]) < 0:
+                    continue
+                centers.append(box[:3])
+                sizes.append(box[3:6])
+            continue
+        # Fisheye3DOD-style custom datasets store boxes in an ``annos``
+        # mapping rather than the KITTI-360 ``instances`` list.
+        boxes = np.asarray(
+            info.get("annos", {}).get("gt_boxes", np.zeros((0, 7))),
+            dtype=np.float64,
+        ).reshape(-1, 7)
+        centers.extend(boxes[:, :3])
+        sizes.extend(boxes[:, 3:6])
     centers = np.asarray(centers, dtype=np.float64)
     sizes = np.asarray(sizes, dtype=np.float64)
     print(f"fit k-means on {len(centers)} GT centers -> {args.num_anchor} clusters")

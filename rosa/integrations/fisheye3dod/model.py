@@ -12,14 +12,6 @@ from projects.mmdet3d_plugin.data_preprocessor.sparse4d_preprocessor import (
 )
 from projects.mmdet3d_plugin.models.sparse4d import Sparse4D
 
-from rosa.integrations.sparse4d import (
-    ROSANativeBaselineHead,
-    ROSAOfficialResidualNativeBaselineHead,
-    ROSAOfficialResidualRefinementHead,
-    ROSARefinementHead,
-)
-
-
 @MODELS.register_module()
 class Fisheye3DODSingleFrameDataPreprocessor(Sparse4DDataPreprocessor):
     """Keep temporal-only metadata on CPU during single-frame prediction.
@@ -137,12 +129,14 @@ class Fisheye3DODSingleFrameInplaceDataPreprocessor(
 
 
 def _require_temporal_free_metadata_path(head) -> None:
-    if type(head) not in (
-        ROSANativeBaselineHead,
-        ROSAOfficialResidualNativeBaselineHead,
-        ROSAOfficialResidualRefinementHead,
-        ROSARefinementHead,
-    ):
+    allowed = {
+        "ROSANativeBaselineHead",
+        "ROSAOfficialResidualNativeBaselineHead",
+        "ROSAOfficialResidualRefinementHead",
+        "ROSARefinementHead",
+        "FisheyeSparseBoxHead",
+    }
+    if type(head).__name__ not in allowed:
         raise TypeError(
             "single-frame CPU metadata is sealed to the exact "
             "audited temporal-free heads"

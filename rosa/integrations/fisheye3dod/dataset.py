@@ -98,6 +98,14 @@ class Fisheye3DODSparse4DDataset(Det3DDataset):
         )
         valid = labels >= 0
         boxes, labels = boxes[valid], labels[valid]
+        # Det3DDataset normally updates this diagnostic counter inside its
+        # generic annotation parser.  This adapter reads the released
+        # ``annos`` schema directly, so mirror that bookkeeping here; without
+        # it MMEngine misleadingly prints zero instances for every class even
+        # though the returned targets are populated.
+        counts = np.bincount(labels, minlength=len(self.num_ins_per_cat))
+        for label, count in enumerate(counts):
+            self.num_ins_per_cat[label] += int(count)
         if self.with_velocity:
             boxes = np.concatenate(
                 (

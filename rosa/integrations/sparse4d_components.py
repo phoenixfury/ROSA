@@ -50,6 +50,13 @@ class NormalizedSparseBoxKeyPointsGenerator(SparseBox3DKeyPointsGenerator):
             **kwargs,
         )
 
+    def forward(self, anchor: Tensor, *args, **kwargs):
+        return super().forward(
+            _normalized_yaw_geometry(anchor),
+            *args,
+            **kwargs,
+        )
+
 
 @MODELS.register_module()
 class CorrectedSparse4DHead(Sparse4DHead):
