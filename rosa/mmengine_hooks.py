@@ -5,10 +5,70 @@ from __future__ import annotations
 from collections.abc import Mapping
 import os
 from pathlib import Path
+import json
+import time
 
 from mmengine.dist import master_only
 from mmengine.hooks import Hook
 from mmengine.registry import HOOKS
+
+
+class TrainingThroughputProbeHook(Hook):
+    """Measure complete train iterations after warmup on every DDP rank."""
+
+    # Run before LoggerHook, which resets CUDA peak-memory statistics.
+    priority = 'LOW'
+
+    def __init__(self, warmup_iters=4):
+        self.warmup_iters = int(warmup_iters)
+        self.seconds = 0.
+        self.frames = 0
+        self.warmup_peak = 0
+        self.peak_allocated = 0
+        self.peak_reserved = 0
+
+    def before_train(self, runner):
+        import torch
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        self.previous_end = time.perf_counter()
+
+    def before_train_iter(self, runner, batch_idx, data_batch=None):
+        # Start at the previous end, so dataloader wait is included.
+        self.start = self.previous_end
+
+    def after_train_iter(self, runner, batch_idx, data_batch=None, outputs=None):
+        import torch
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+        if runner.iter >= self.warmup_iters:
+            self.seconds += end - self.start
+            self.frames += len(data_batch['data_samples'])
+            self.peak_allocated = max(self.peak_allocated, torch.cuda.max_memory_allocated())
+            self.peak_reserved = max(self.peak_reserved, torch.cuda.max_memory_reserved())
+        elif runner.iter == self.warmup_iters - 1:
+            self.warmup_peak = torch.cuda.max_memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+        self.previous_end = end
+
+    def after_train(self, runner):
+        import torch
+        from mmengine.dist import all_gather_object, get_rank, get_world_size
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        local = dict(rank=get_rank(), gpu=properties.name,
+                     measured_frames=self.frames, measured_seconds=self.seconds,
+                     peak_allocated_bytes=self.peak_allocated,
+                     peak_reserved_bytes=self.peak_reserved,
+                     warmup_peak_allocated_bytes=self.warmup_peak,
+                     total_memory_bytes=properties.total_memory)
+        ranks = all_gather_object(local)
+        if get_rank() == 0:
+            duration = max(row['measured_seconds'] for row in ranks)
+            summary = dict(world_size=get_world_size(), ranks=ranks,
+                           samples_per_second=sum(row['measured_frames'] for row in ranks) / max(duration, 1e-9))
+            destination = Path(runner.work_dir) / 'throughput_probe.json'
+            destination.write_text(json.dumps(summary, indent=2) + '\n')
+            runner.logger.info('Training throughput probe: %s', summary)
 
 
 class CheckpointContractHook(Hook):

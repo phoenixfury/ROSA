@@ -100,6 +100,11 @@ def parse_args() -> argparse.Namespace:
         help="Resume from a trusted local checkpoint path or auto-discover it.",
     )
     train.add_argument("--amp", action="store_true")
+    train.add_argument('--fast', action='store_true',
+                       help='Enable cuDNN tuning and TF32; disable deterministic algorithms')
+    train.add_argument('--throughput-probe', type=int, default=0,
+                       help='Only run this many training iterations, without validation/checkpoints')
+    train.add_argument('--probe-warmup', type=int, default=4)
 
     evaluate = commands.add_parser("evaluate")
     _add_common_arguments(evaluate)
@@ -365,6 +370,22 @@ def _compile_fast_inference(runner: Runner, config: Config) -> bool:
 
 
 def train(args: argparse.Namespace, config: Config) -> None:
+    if args.fast:
+        config.env_cfg.cudnn_benchmark = True
+        config.randomness.deterministic = False
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    if args.throughput_probe:
+        if args.resume or args.throughput_probe <= args.probe_warmup or args.probe_warmup < 0:
+            raise ValueError('A fresh probe needs total iterations > warmup >= 0')
+        config.train_cfg = dict(type='IterBasedTrainLoop', max_iters=args.throughput_probe,
+                                val_interval=args.throughput_probe + 1)
+        config.val_cfg = config.val_dataloader = config.val_evaluator = None
+        config.param_scheduler = []
+        config.custom_hooks = []
+        config.default_hooks.checkpoint = None
+        config.default_hooks.logger.interval = args.throughput_probe
+        config.train_dataloader.drop_last = True
     if args.resume:
         os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
         config.resume = True
@@ -399,6 +420,9 @@ def train(args: argparse.Namespace, config: Config) -> None:
         if clip_grad is not None:
             clip_grad["error_if_nonfinite"] = False
     runner = Runner.from_cfg(config)
+    if args.throughput_probe:
+        from rosa.mmengine_hooks import TrainingThroughputProbeHook
+        runner.register_hook(TrainingThroughputProbeHook(args.probe_warmup))
     provenance = None
     if getattr(runner, "rank", 0) == 0:
         from rosa.provenance import capture_external_provenance

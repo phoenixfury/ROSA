@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import Counter
 import csv
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[3]
 ROSA = ROOT / 'projects/ROSA'
@@ -34,6 +36,125 @@ from mmdet3d.registry import DATASETS, TASK_UTILS
 CLASSES = ('Car', 'Van', 'Truck', 'Bus', 'Pedestrian', 'Cyclist')
 
 
+def batch_plan(gpus, batch_size, effective_batch):
+    if min(gpus, batch_size, effective_batch) < 1:
+        raise ValueError('GPU count and batch sizes must be positive')
+    micro_batch = gpus * batch_size
+    if effective_batch % micro_batch:
+        raise ValueError(f'Effective batch {effective_batch} must be divisible by '
+                         f'{gpus} GPUs x {batch_size} samples/GPU')
+    return dict(per_gpu_batch=batch_size, accumulation=effective_batch // micro_batch,
+                effective_batch=effective_batch)
+
+
+def runtime_options(config, plan, workers):
+    original_batch = config.train_dataloader.batch_size
+    options = [f'train_dataloader.batch_size={plan["per_gpu_batch"]}',
+               f'optim_wrapper.accumulative_counts={plan["accumulation"]}',
+               f'train_dataloader.num_workers={workers}',
+               f'train_dataloader.persistent_workers={workers > 0}',
+               'train_dataloader.pin_memory=True',
+               'model.data_preprocessor.non_blocking=True',
+               f'experiment_contract.per_gpu_batch={plan["per_gpu_batch"]}',
+               f'experiment_contract.effective_batch={plan["effective_batch"]}']
+    if workers:
+        options.append('train_dataloader.prefetch_factor=2')
+    # Preserve warmup exposure/optimizer-update count when moving from
+    # accumulation-heavy batch 1 to larger physical batches.
+    ratio = original_batch / plan['per_gpu_batch']
+    for index, schedule in enumerate(config.param_scheduler):
+        if schedule.get('type') == 'LinearLR' and not schedule.get('by_epoch', False):
+            begin = round(schedule.get('begin', 0) * ratio)
+            end = max(begin + 1, round(schedule['end'] * ratio))
+            options += [f'param_scheduler.{index}.begin={begin}',
+                        f'param_scheduler.{index}.end={end}']
+    return options
+
+
+def merge_options(config, values):
+    from mmengine.config import DictAction
+    overrides = dict(item.split('=', 1) for item in values)
+    config.merge_from_dict({key: DictAction._parse_iterable(value)
+                            for key, value in overrides.items()})
+
+
+def training_command(args, config_path, work_dir, options):
+    command = [sys.executable]
+    if args.gpus > 1:
+        command += ['-m', 'torch.distributed.run', '--nnodes=1',
+                    f'--nproc_per_node={args.gpus}', f'--master_port={args.master_port}',
+                    '--master_addr=127.0.0.1']
+    command += [str(ROSA / 'tools/run.py'), 'train', str(config_path), '--amp',
+                '--launcher', 'pytorch' if args.gpus > 1 else 'none',
+                '--work-dir', str(work_dir)]
+    if args.fast:
+        command.append('--fast')
+    if options:
+        command += ['--cfg-options', *options]
+    return command
+
+
+def select_probe_result(rows, memory_margin):
+    acceptable = [row for row in rows if row.get('status') == 'ok' and all(
+        rank['peak_allocated_bytes'] <= (1. - memory_margin) * rank['total_memory_bytes']
+        for rank in row['ranks'])]
+    if not acceptable:
+        raise RuntimeError('No batch passed the throughput/memory probe; inspect batch_probe logs')
+    return max(acceptable, key=lambda row: row['samples_per_second'])
+
+
+def auto_batch(args, config, config_path, work_dir, dense_indices):
+    candidates = sorted(set(args.batch_candidates))
+    candidates = [batch for batch in candidates if batch > 0 and
+                  args.effective_batch % (batch * args.gpus) == 0]
+    if not candidates:
+        raise ValueError('No batch candidate divides the requested effective batch')
+    rows = []
+    probe_root = work_dir / 'batch_probe'
+    probe_root.mkdir(parents=True, exist_ok=True)
+    for batch in candidates:
+        plan = batch_plan(args.gpus, batch, args.effective_batch)
+        probe_dir = probe_root / f'batch_{batch}'
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        # An earlier probe must never be mistaken for a successful new run.
+        report = probe_dir / 'throughput_probe.json'
+        if report.exists():
+            report.rename(probe_dir / f'throughput_probe.previous.{time.time_ns()}.json')
+        options = [*args.cfg_options, *runtime_options(config, plan, args.workers),
+                   'train_dataloader.dataset.dataset.indices=' + repr(dense_indices)]
+        command = training_command(args, config_path, probe_dir, options)
+        accumulation = plan['accumulation']
+        warmup = ((args.probe_warmup + accumulation - 1) // accumulation) * accumulation
+        measured = ((args.probe_iterations - args.probe_warmup + accumulation - 1) // accumulation) * accumulation
+        command[command.index('--cfg-options'):command.index('--cfg-options')] = [
+            '--throughput-probe', str(warmup + measured), '--probe-warmup', str(warmup)]
+        log_path = probe_dir / 'console.log'
+        print(f'Probing {batch} samples/GPU, accumulation {plan["accumulation"]}; log: {log_path}', flush=True)
+        with log_path.open('w') as log:
+            result = subprocess.run(command, cwd=ROOT, env=os.environ.copy(),
+                                    stdout=log, stderr=subprocess.STDOUT)
+        if result.returncode:
+            log_text = log_path.read_text(errors='replace')
+            if 'out of memory' in log_text.lower() or 'cublas_status_alloc_failed' in log_text.lower():
+                row = dict(status='oom', **plan)
+                print(f'Batch {batch}: CUDA out of memory; trying the next candidate.', flush=True)
+            else:
+                raise RuntimeError(f'Training probe failed (not an OOM); inspect {log_path}\n' +
+                                   '\n'.join(log_text.splitlines()[-12:]))
+        else:
+            row = dict(json.loads(report.read_text()), status='ok', **plan)
+            peak_gib = max(rank['peak_allocated_bytes'] for rank in row['ranks']) / 2**30
+            print(f'Batch {batch}: {row["samples_per_second"]:.2f} frames/s, '
+                  f'peak allocated {peak_gib:.2f} GiB/GPU', flush=True)
+        rows.append(row)
+        (probe_root / 'results.json').write_text(json.dumps(rows, indent=2) + '\n')
+    selected = select_probe_result(rows, args.memory_margin)
+    (probe_root / 'selected.json').write_text(json.dumps(selected, indent=2) + '\n')
+    print(f'Selected batch {selected["per_gpu_batch"]}/GPU, accumulation '
+          f'{selected["accumulation"]}, effective batch {args.effective_batch}', flush=True)
+    return batch_plan(args.gpus, selected['per_gpu_batch'], args.effective_batch)
+
+
 def preflight(config, work_dir):
     checkpoint = Path(config.load_from)
     if not checkpoint.is_file():
@@ -49,6 +170,7 @@ def preflight(config, work_dir):
     torch.manual_seed(config.randomness.seed)
     missing_images = []
     base = dataset.dataset
+    density = []
     for index in range(len(base)):
         sample = base.get_data_info(index)
         ann = sample['annos']
@@ -57,6 +179,7 @@ def preflight(config, work_dir):
         if not np.isfinite(boxes).all() or (boxes[:, 3:6] <= 0).any():
             raise ValueError(f'Invalid GT geometry: {sample["token"]}')
         counts.update(names.tolist())
+        density.append(len(names))
         limits = np.asarray([48., 48., 48., 48., 36., 42.])
         labels = np.asarray([CLASSES.index(name) for name in names], dtype=np.int64)
         in_range = np.linalg.norm(boxes[:, :2], axis=1) < limits[labels]
@@ -99,6 +222,7 @@ def preflight(config, work_dir):
         example_stratified_dn_counts=dict(dn_counts),
         per_gpu_batch=config.train_dataloader.batch_size,
         accumulation=config.optim_wrapper.accumulative_counts,
+        effective_batch=config.experiment_contract.get('effective_batch'),
         epochs=config.train_cfg.max_epochs,
         annotation_review_rows=len(review),
         note='Review rows flag candidates; no labels were automatically changed.')
@@ -109,6 +233,9 @@ def preflight(config, work_dir):
         writer.writeheader()
         writer.writerows(review)
     print(json.dumps(summary, indent=2), flush=True)
+    # Stress all candidates with crowded frames (the largest DN query count),
+    # rather than letting a random empty batch suggest an unsafe batch size.
+    return np.argsort(-np.asarray(density), kind='stable')[:64].tolist()
 
 
 def main():
@@ -117,6 +244,18 @@ def main():
     parser.add_argument('--data-root', type=Path)
     parser.add_argument('--init-checkpoint', type=Path)
     parser.add_argument('--gpus', type=int, default=2)
+    parser.add_argument('--batch-size', type=int, default=2, help='Samples per GPU; default 2')
+    parser.add_argument('--effective-batch', type=int, default=8,
+                        help='Global effective batch; accumulation is calculated automatically')
+    parser.add_argument('--workers', type=int, default=4, help='Dataloader workers per GPU')
+    parser.add_argument('--fast', action='store_true', help='Enable cuDNN tuning and TF32')
+    parser.add_argument('--auto-batch', action='store_true', help='Benchmark candidates, then train with the fastest safe one')
+    parser.add_argument('--batch-candidates', type=int, nargs='+', default=[1, 2, 4])
+    parser.add_argument('--probe-only', action='store_true', help='Benchmark batches and exit without full training')
+    parser.add_argument('--probe-iterations', type=int, default=12)
+    parser.add_argument('--probe-warmup', type=int, default=4)
+    parser.add_argument('--memory-margin', type=float, default=.08,
+                        help='Minimum fraction of GPU memory not allocated by PyTorch during the probe')
     parser.add_argument('--master-port', type=int, default=29503)
     parser.add_argument('--work-dir', type=Path)
     parser.add_argument('--preflight-only', action='store_true')
@@ -126,6 +265,14 @@ def main():
     args = parser.parse_args()
     if args.gpus < 1:
         parser.error('--gpus must be positive')
+    if args.workers < 0 or not 0 <= args.memory_margin < 1:
+        parser.error('workers must be nonnegative and memory-margin must be in [0,1)')
+    if args.probe_warmup < 0 or args.probe_iterations <= args.probe_warmup:
+        parser.error('probe-iterations must exceed probe-warmup >= 0')
+    if args.probe_only and not args.auto_batch:
+        parser.error('--probe-only requires --auto-batch')
+    if args.auto_batch and (args.resume or args.smoke_test):
+        parser.error('--auto-batch needs a fresh run; cannot combine with --resume or --smoke-test')
     if args.data_root:
         os.environ['ROSA_DATA_ROOT'] = str(args.data_root.resolve())
     if args.init_checkpoint:
@@ -133,33 +280,31 @@ def main():
     name = 'rosa_vov99_balanced_finetune_8e.py' if args.recipe == 'finetune' else 'rosa_vov99_balanced_retrain_24e.py'
     config_path = ROSA / 'configs/fisheye3dod' / name
     config = Config.fromfile(config_path)
-    if args.cfg_options:
-        from mmengine.config import DictAction
-        overrides = dict(item.split('=', 1) for item in args.cfg_options)
-        config.merge_from_dict({key: DictAction._parse_iterable(value) for key, value in overrides.items()})
+    reserved = {'train_dataloader.batch_size', 'optim_wrapper.accumulative_counts',
+                'train_dataloader.num_workers'}
+    if any(item.split('=', 1)[0] in reserved for item in args.cfg_options):
+        parser.error('Use --batch-size, --effective-batch and --workers for batch/worker settings')
+    merge_options(config, args.cfg_options)
+    original_config = copy.deepcopy(config)
+    plan = batch_plan(args.gpus, args.batch_size, args.effective_batch)
+    merge_options(config, runtime_options(original_config, plan, args.workers))
     work_dir = (args.work_dir or Path(config.work_dir)).resolve()
     if args.smoke_test and args.work_dir is None:
         work_dir = work_dir.with_name(work_dir.name + '_smoke')
     if not args.preflight_only and not args.resume and (work_dir / 'last_checkpoint').exists():
         raise FileExistsError(f'{work_dir} already has checkpoints; use --resume or a new --work-dir')
-    preflight(config, work_dir)
+    dense_indices = preflight(config, work_dir)
     if args.preflight_only:
         return
     if torch.cuda.device_count() < args.gpus:
         raise RuntimeError(f'{args.gpus} GPUs requested, but {torch.cuda.device_count()} visible; set --gpus appropriately')
-    command = [sys.executable]
-    if args.gpus > 1:
-        command += ['-m', 'torch.distributed.run', '--nnodes=1',
-                    f'--nproc_per_node={args.gpus}', f'--master_port={args.master_port}']
-        # A fixed rendezvous endpoint gives this independent training job its
-        # own port even when another torchrun job is active on the server.
-        command += ['--master_addr=127.0.0.1']
-    command += [str(ROSA / 'tools/run.py'), 'train', str(config_path), '--amp',
-                '--launcher', 'pytorch' if args.gpus > 1 else 'none',
-                '--work-dir', str(work_dir)]
-    if args.resume:
-        command += ['--resume', str(args.resume.resolve())]
-    overrides = list(args.cfg_options)
+    if args.auto_batch:
+        plan = auto_batch(args, original_config, config_path, work_dir, dense_indices)
+        merge_options(config, runtime_options(original_config, plan, args.workers))
+        preflight(config, work_dir)
+        if args.probe_only:
+            return
+    overrides = [*args.cfg_options, *runtime_options(original_config, plan, args.workers)]
     if args.smoke_test:
         overrides += [
             'train_cfg._delete_=True', 'train_cfg.type=IterBasedTrainLoop',
@@ -172,8 +317,10 @@ def main():
             'default_hooks.checkpoint.rule=None',
             'default_hooks.checkpoint.interval=10000', 'default_hooks.checkpoint.by_epoch=False',
         ]
-    if overrides:
-        command += ['--cfg-options', *overrides]
+    command = training_command(args, config_path, work_dir, overrides)
+    if args.resume:
+        position = command.index('--cfg-options')
+        command[position:position] = ['--resume', str(args.resume.resolve())]
     print('$ ' + shlex.join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=os.environ.copy(), check=True)
 

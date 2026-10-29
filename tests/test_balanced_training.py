@@ -178,6 +178,37 @@ class BalancedTrainingTests(unittest.TestCase):
         self.assertEqual(payload['frames'][0]['boxes_3d'][0][2], 0.)
         self.assertEqual(float(original.tensor[0, 2]), -1.)
 
+    def test_larger_batch_preserves_effective_batch_and_warmup(self):
+        import runpy
+        from mmengine.config import Config
+        launcher = runpy.run_path(str(ROOT / 'projects/ROSA/tools/train_balanced_fisheye.py'))
+        config = Config(dict(train_dataloader=dict(batch_size=1),
+            param_scheduler=[dict(type='LinearLR', begin=0, end=500, by_epoch=False)],
+            optim_wrapper=dict(accumulative_counts=4), experiment_contract=dict()))
+        plan = launcher['batch_plan'](2, 2, 8)
+        self.assertEqual(plan['accumulation'], 2)
+        launcher['merge_options'](config, launcher['runtime_options'](config, plan, 4))
+        self.assertEqual(config.train_dataloader.batch_size, 2)
+        self.assertEqual(config.optim_wrapper.accumulative_counts, 2)
+        self.assertEqual(config.param_scheduler[0].end, 250)
+        self.assertEqual(config.experiment_contract.effective_batch, 8)
+        self.assertEqual(launcher['batch_plan'](2, 4, 8)['accumulation'], 1)
+        with self.assertRaises(ValueError):
+            launcher['batch_plan'](2, 3, 8)
+
+    def test_auto_batch_selects_throughput_with_memory_margin(self):
+        import runpy
+        launcher = runpy.run_path(str(ROOT / 'projects/ROSA/tools/train_balanced_fisheye.py'))
+        rows = [dict(status='ok', per_gpu_batch=1, samples_per_second=3.,
+                     ranks=[dict(peak_allocated_bytes=50, total_memory_bytes=100)]),
+                dict(status='ok', per_gpu_batch=2, samples_per_second=5.,
+                     ranks=[dict(peak_allocated_bytes=80, total_memory_bytes=100)]),
+                dict(status='ok', per_gpu_batch=4, samples_per_second=6.,
+                     ranks=[dict(peak_allocated_bytes=98, total_memory_bytes=100)]),
+                dict(status='oom', per_gpu_batch=8)]
+        best = launcher['select_probe_result'](rows, .08)
+        self.assertEqual(best['per_gpu_batch'], 2)
+
 
 if __name__ == '__main__':
     unittest.main()
