@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import _codecs
+import hashlib
 from collections.abc import Mapping
 from dataclasses import asdict
 import json
@@ -227,14 +229,35 @@ def _load_checkpoint_without_executing_code(checkpoint_path: Path):
         _reconstruct,
         scalar,
         builtins.getattr,
+        _codecs.encode,
         *dtype_classes,
     ]
-    with torch.serialization.safe_globals(safe_globals):
-        return torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
+    # ``safe_globals`` is a context manager in newer PyTorch releases, while
+    # PyTorch 2.4 (used by the OpenMMLab environment) only exposes the
+    # process-level ``add_safe_globals`` API.  Keep weights-only loading on
+    # both versions instead of falling back to unrestricted pickle loading.
+    safe_globals_context = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals_context is not None:
+        with safe_globals_context(safe_globals):
+            return torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe_globals is None:
+        raise RuntimeError(
+            "This PyTorch version cannot safely load the checkpoint metadata: "
+            "neither torch.serialization.safe_globals nor add_safe_globals "
+            "is available."
         )
+    add_safe_globals(safe_globals)
+    return torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
 
 
 def _topology_signature(config) -> tuple:
@@ -385,6 +408,22 @@ def train(args: argparse.Namespace, config: Config) -> None:
             runner.work_dir,
         )
     metadata = _checkpoint_contract_metadata(config) or {}
+    experiment = config.get('experiment_contract', {})
+    if experiment.get('training_recipe'):
+        metadata['training_recipe'] = experiment['training_recipe']
+        metadata['training_contract'] = dict(experiment)
+        root = Path(__file__).resolve().parents[3]
+        implementation_files = (
+            'projects/mmdet3d_plugin/models/sparse4d_head.py',
+            'projects/mmdet3d_plugin/models/detection3d/target.py',
+            'projects/mmdet3d_plugin/models/detection3d/decoder.py',
+            'projects/ROSA/rosa/integrations/fisheye3dod/balanced_training.py',
+            'projects/Fisheye3DOD/models/petr/vovnetcp.py',
+        )
+        metadata['training_implementation_sha256'] = {
+            path: hashlib.sha256((root / path).read_bytes()).hexdigest()
+            for path in implementation_files
+        }
     if provenance is not None:
         metadata["external_provenance"] = provenance
         metadata["source_revision"] = provenance["source_revision"]
