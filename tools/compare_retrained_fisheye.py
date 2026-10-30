@@ -169,7 +169,7 @@ def plots(result, output):
     import matplotlib.pyplot as plt
     figure, axes = plt.subplots(2, 2, figsize=(13, 9))
     for key, label in [('baseline_history', 'Original baseline'),
-                       ('training_history', 'Balanced retrain')]:
+        ('training_history', result.get('training_label', 'Training run'))]:
         if key not in result:
             continue
         rows = result[key]['validation']
@@ -184,14 +184,14 @@ def plots(result, output):
         axes[1, 0].plot([r['total']['recall'] for r in rows],
                         [r['total']['precision'] for r in rows], marker='.', label=name)
     axes[1, 0].set(xlabel='Recall', ylabel='Precision',
-                   title='2 m diagnostic matching; score sweep (no NMS)')
+                   title='2 m diagnostic matching; score sweep of saved outputs')
     axes[1, 0].legend(fontsize=8)
     axes[1, 0].grid(alpha=.25)
     rows = result.get('training_history', {}).get('validation', [])
     for name in CLASSES[1:]:
         axes[1, 1].plot([r['epoch'] for r in rows], [r[f'{name}_AP'] * 100 for r in rows],
                        label=name)
-    axes[1, 1].set(xlabel='Epoch', ylabel='AP (%)', title='Retrained rare-class validation AP')
+    axes[1, 1].set(xlabel='Epoch', ylabel='AP (%)', title='Rare-class validation AP')
     axes[1, 1].legend(fontsize=8)
     axes[1, 1].grid(alpha=.25)
     figure.tight_layout()
@@ -204,6 +204,7 @@ def main():
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--model', action='append', required=True, metavar='NAME=DIR')
     parser.add_argument('--training-run', type=Path)
+    parser.add_argument('--training-label', default='Training run')
     parser.add_argument('--baseline-run', type=Path)
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
@@ -222,6 +223,7 @@ def main():
                       'rosa/fisheye3dod_infos_train.pkl'), infos))
     if args.training_run:
         result['training_history'] = training_history(args.training_run)
+        result['training_label'] = args.training_label
     if args.baseline_run:
         result['baseline_history'] = training_history(args.baseline_run)
     models = result.setdefault('models', {})

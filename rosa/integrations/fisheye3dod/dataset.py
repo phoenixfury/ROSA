@@ -147,8 +147,14 @@ class Fisheye3DODSparse4DDataset(Det3DDataset):
         info["frame_idx"] = int(frame_id)
         info["prev"] = str(meta.get("prev_id", ""))
         info["next"] = str(meta.get("next_id", ""))
-        info["timestamp"] = int(frame_id) * 100_000
-        info["ego2global"] = np.eye(4, dtype=np.float32)
+        acquisition_ns = meta.get("acquisition_timestamp_ns")
+        # Temporal exports use the LiDAR acquisition clock and the matching
+        # world-from-LiDAR pose. Preserve the legacy fallback for older PKLs.
+        info["timestamp"] = (float(acquisition_ns) * 1e-9
+                             if acquisition_ns is not None
+                             else int(frame_id) * 100_000)
+        info["ego2global"] = np.asarray(
+            meta.get("T_world_CLIDAR", np.eye(4)), dtype=np.float32)
         if not self.test_mode:
             info["ann_info"] = self.parse_anno_info(info)
         if self.test_mode and self.load_eval_anns:
