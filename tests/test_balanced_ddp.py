@@ -70,11 +70,14 @@ def worker(rank, rendezvous, output_dir):
     model = DistributedDataParallel(CheckpointedTrainingProbe(), find_unused_parameters=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     losses = []
-    for _ in range(3):
+    for step in range(1, 4):
         optimizer.zero_grad()
         loss = model(torch.randn(1, 8, 8, 8), rank)
         assert torch.isfinite(loss), loss
         loss.backward()
+        for name, buffer in model.named_buffers():
+            if name.endswith('num_batches_tracked'):
+                assert int(buffer) == step, (name, int(buffer), step)
         for name, parameter in model.named_parameters():
             assert parameter.grad is not None, name
             assert torch.isfinite(parameter.grad).all(), name

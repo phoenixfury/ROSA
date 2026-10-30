@@ -1,5 +1,12 @@
 # Corrected ROSA training on the combined custom dataset
 
+**Current recommendation after the completed balanced retrain:** use the
+[baseline epoch-16 adaptation recipe](BASELINE_ADAPTATION.md) with
+`--recipe baseline-adapt`: live BatchNorm, restored backbone LR, new decoder,
+and class-wise NMS. Pull both ROSA and Fisheye3DOD for the BN checkpointing fix.
+The recipes below remain available as historical comparison runs; the clean
+balanced retrain did not outperform the original baseline.
+
 Use the new launcher from the mmdetection3d checkout. It sets both project import paths and the Fisheye3DOD root, validates both splits/images/anchors, and writes `balanced_preflight.json` plus `rare_class_review.csv` into the work directory. Existing PKLs/images do not need rewriting.
 
 ## Install the code update on the server

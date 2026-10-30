@@ -31,9 +31,14 @@ import torch
 from mmengine.config import Config
 from mmengine.fileio import load
 from mmengine.registry import init_default_scope
-from mmdet3d.registry import DATASETS, TASK_UTILS
+from mmdet3d.registry import DATASETS, MODELS, TASK_UTILS
 
 CLASSES = ('Car', 'Van', 'Truck', 'Bus', 'Pedestrian', 'Cyclist')
+RECIPES = {
+    'finetune': 'rosa_vov99_balanced_finetune_8e.py',
+    'retrain': 'rosa_vov99_balanced_retrain_24e.py',
+    'baseline-adapt': 'rosa_vov99_baseline_adapt_8e.py',
+}
 
 
 def batch_plan(gpus, batch_size, effective_batch):
@@ -156,6 +161,13 @@ def auto_batch(args, config, config_path, work_dir, dense_indices):
 
 
 def preflight(config, work_dir):
+    if (config.model.img_backbone.type == 'VoVNetCP' and
+            not config.model.img_backbone.norm_eval):
+        backbone_class = MODELS.get('VoVNetCP')
+        source = sys.modules[backbone_class.__module__]
+        if not hasattr(source, '_private_batchnorm_recompute_buffers'):
+            raise RuntimeError('Live BatchNorm needs the checkpoint-recompute fix. '
+                'Commit/pull projects/Fisheye3DOD as well as projects/ROSA before training.')
     checkpoint = Path(config.load_from)
     if not checkpoint.is_file():
         raise FileNotFoundError(f'Initialization checkpoint missing: {checkpoint}; use --init-checkpoint')
@@ -224,6 +236,12 @@ def preflight(config, work_dir):
         accumulation=config.optim_wrapper.accumulative_counts,
         effective_batch=config.experiment_contract.get('effective_batch'),
         epochs=config.train_cfg.max_epochs,
+        backbone_frozen_stages=config.model.img_backbone.frozen_stages,
+        backbone_norm_eval=config.model.img_backbone.norm_eval,
+        head_peak_lr=config.optim_wrapper.optimizer.lr,
+        backbone_peak_lr=(config.optim_wrapper.optimizer.lr *
+            config.optim_wrapper.paramwise_cfg.custom_keys.img_backbone.lr_mult),
+        decoder=dict(config.model.head.decoder),
         annotation_review_rows=len(review),
         note='Review rows flag candidates; no labels were automatically changed.')
     (work_dir / 'balanced_preflight.json').write_text(json.dumps(summary, indent=2) + '\n')
@@ -240,7 +258,7 @@ def preflight(config, work_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--recipe', choices=['finetune', 'retrain'], default='finetune')
+    parser.add_argument('--recipe', choices=list(RECIPES), default='finetune')
     parser.add_argument('--data-root', type=Path)
     parser.add_argument('--init-checkpoint', type=Path)
     parser.add_argument('--gpus', type=int, default=2)
@@ -277,8 +295,7 @@ def main():
         os.environ['ROSA_DATA_ROOT'] = str(args.data_root.resolve())
     if args.init_checkpoint:
         os.environ['ROSA_INIT_CKPT'] = str(args.init_checkpoint.resolve())
-    name = 'rosa_vov99_balanced_finetune_8e.py' if args.recipe == 'finetune' else 'rosa_vov99_balanced_retrain_24e.py'
-    config_path = ROSA / 'configs/fisheye3dod' / name
+    config_path = ROSA / 'configs/fisheye3dod' / RECIPES[args.recipe]
     config = Config.fromfile(config_path)
     reserved = {'train_dataloader.batch_size', 'optim_wrapper.accumulative_counts',
                 'train_dataloader.num_workers'}
