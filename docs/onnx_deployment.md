@@ -154,6 +154,46 @@ timings. Scores are quality-weighted class probabilities. The default display
 threshold is 0.10; `--score-threshold` changes it. There is no distance filter
 by default; use `--max-distance 60` for an explicit XY radius if desired.
 
+### Tuned checkpoint-bound thresholds
+
+For E007 epoch 1, `work_dirs/threshold_tuning_e1_20261103/REPORT.md` compares
+exact score cutoffs on all 601 cached validation frames. The recommended
+`balanced_profile.json` retains 85.1% of TP present at 0.10 while rejecting
+57.1% of FP, using class-specific cutoffs and the unchanged NMS. The more
+conservative `recall_first_profile.json` retains 95.1% of those TP and rejects
+23.4% of FP. `max_f1_profile.json` maximizes aggregate F1 but loses 24.4% of
+baseline TP. These estimates use class-aware 2m matching against pseudo-labels,
+not independent manual truth; they are not official AP/NDS improvements.
+
+Use one profile instead of `--score-threshold` (the CLI checks its checkpoint
+SHA256 and NMS contract):
+
+```bash
+conda run --no-capture-output -n openmmlab python \
+  projects/ROSA/tools/infer_fisheye_onnx.py \
+  --model "$BUNDLE/rosa_e1.onnx" \
+  --samples "$BUNDLE/validation_samples.json" \
+  --threshold-profile projects/ROSA/work_dirs/threshold_tuning_e1_20261103/balanced_profile.json \
+  --provider cuda --max-frames 10 \
+  --output "$BUNDLE/predictions_balanced_10_frames.json"
+```
+
+Van has no validation GT and Cyclist has only 12 boxes; these classes retain
+0.10 rather than being optimized away. The measurements use native AMP
+predictions: FP32 ONNX can differ at score boundaries, so its complete
+operating-point metrics still need confirmation. No ONNX re-export is needed.
+
+To reproduce tuning with the saved unfiltered, already-NMSed predictions:
+
+```bash
+conda run --no-capture-output -n openmmlab python \
+  projects/ROSA/tools/tune_fisheye_thresholds.py \
+  --predictions-dir projects/ROSA/work_dirs/singleframe_refresh_analysis_20261102/evaluations/best_fisheye_bev_mAP_epoch_1 \
+  --data-root data/Custom/combined_improved_detzero_rosa \
+  --checkpoint projects/ROSA/work_dirs/singleframe_refresh_20261031/best_fisheye_bev_mAP_epoch_1.pth \
+  --output-dir projects/ROSA/work_dirs/threshold_tuning_e1_20261103
+```
+
 ## Export / verify again
 
 Use trusted local PyTorch checkpoints only. No training is started:

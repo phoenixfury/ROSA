@@ -1,5 +1,15 @@
 # ROSA
 
+For this checkout's custom-bag temporal training extension, see
+[the synchronized dataset runbook](../../tools/detzero_temporal_pipeline/README_START_HERE.md#6-temporal-rosa-training-on-the-chronological-combined-dataset).
+It adds ego-compensated recurrent query memory to the existing decoder and
+requires the chronological dataset and dedicated temporal launcher; the
+published single-frame recipes below retain their original behavior.
+
+Custom-dataset experiment history, source patches, metrics and decisions are
+tracked in [EXPERIMENTS.md](EXPERIMENTS.md). The current controlled decoder
+adaptation procedure is in [joint_velocity_recovery.md](docs/joint_velocity_recovery.md).
+
 **[WACV 2027] Ray-aware Observation Selection and Aggregation for Surround-View Fisheye 3D Detection**
 
 This repository is the official PyTorch implementation of **ROSA**, accepted to WACV 2027.
@@ -243,3 +253,11 @@ ROSA is built on [Sparse4D](https://github.com/HorizonRobotics/Sparse4D) and
 evaluated with the [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD)
 benchmark. The KITTI-360 arm uses the FishBEVOD VoVNet-99 backbone released
 with Fisheye3DOD. We thank the authors of both projects.
+
+## Custom single-frame ONNX deployment
+
+See [coordinate conventions, export and ONNX Runtime commands](docs/onnx_deployment.md).
+The E007 epoch-1 export produces center-origin CLIDAR boxes (x forward, y left,
+z up), retains learned camera-ray fusion, and uses explicit class-wise rotated
+BEV NMS in the standalone runtime. No axis converter is needed; MMDetection's
+bottom-center `.tensor` storage must not be confused with gravity-center output.

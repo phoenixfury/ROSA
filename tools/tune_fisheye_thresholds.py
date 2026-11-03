@@ -127,13 +127,13 @@ def report(result, destination):
     rows = result['policies']
     lines = ['# E007 epoch-1 score-threshold tuning', '',
         'Best detection checkpoint: `best_fisheye_bev_mAP_epoch_1.pth`. '
-        '601 cached validation frames; no weights, NMS, or training changed.', '',
+        '%d cached validation frames; no weights, NMS, or training changed.' % result['frames'], '',
         'Recommended for preserving most existing TP while rejecting most FP: '
         '**balanced_profile.json**, retaining at least 85% of each supported class\'s baseline TP. '
         'For stricter TP preservation use **recall_first_profile.json** (95% by default). '
-        'The maximum-F1 global cutoff is %.6f, but loses roughly one quarter of baseline TP. '
-        'There is no cutoff that removes every false positive without losing true positives.'
-        % rows['global_max_f1']['thresholds']['Car'], '',
+        f"The maximum-F1 global cutoff is {rows['global_max_f1']['thresholds']['Car']:.6f}, "
+        'but loses roughly one quarter of baseline TP. '
+        'There is no cutoff that removes every false positive without losing true positives.', '',
         '| Policy | Global cutoff | TP | FP | Precision | Recall | Existing TP retained | FP removed |',
         '|---|---:|---:|---:|---:|---:|---:|---:|']
     for name, row in rows.items():
@@ -143,7 +143,8 @@ def report(result, destination):
             (name, cutoff, r['tp'], r['fp'], 100*r['precision'], 100*r['recall'],
              100*r['baseline_tp_retention'], 100*r['baseline_fp_removed_fraction']))
     lines += ['', 'TP retention and FP removal are relative to score >=0.10, '
-              'not relative to all real objects. Recall uses all 5,635 in-range GT boxes.', '',
+              'not relative to all real objects. Recall uses all %d in-range GT boxes.'
+              % rows['baseline_0.1']['total']['gt'], '',
               '## Recommended balanced per-class profile', '',
               'At least 85% of each supported class\'s baseline TP are retained. '
               'Unsupported classes stay at 0.10. This protects minority classes compared '
@@ -177,8 +178,10 @@ def report(result, destination):
               '- These are validation-tuned operating points, not an official AP/NDS improvement '
               'or an unbiased test. High-confidence duplicates can survive score filtering.',
               '- Scores are promoted to float64 for exact threshold comparisons. The old NumPy '
-              'audit compared float16 AMP scores to a float16-rounded cutoff: its 0.10 included '
-              '15 scores actually equal to 0.0999755859375 (1 TP, 14 FP). This report excludes them.',
+              'audit rounded the cutoff to the score dtype. Its 0.10 included '
+              '%d scores actually below 0.10 (%d TP, %d FP). This report excludes them.' %
+              (result['legacy_cutoff_rounding']['extra_predictions'],
+               result['legacy_cutoff_rounding']['extra_tp'], result['legacy_cutoff_rounding']['extra_fp']),
               '- No retraining or ONNX re-export is needed. Apply the cutoff after decoding, '
               'keeping class-wise rotated BEV NMS at IoU 0.5.', '',
               'These measured counts use cached native AMP predictions. ONNX FP32 score '
@@ -214,6 +217,10 @@ def main():
     if checkpoint_sha != record['sha256']:
         raise ValueError('Checkpoint does not match the cached inference provenance')
     events, gt = match_events(frames)
+    legacy_cutoffs = np.asarray([float(np.asarray(.1, dtype=f['scores'].dtype)) for f in frames])
+    extras = events[(events[:, 0] < .1) &
+                    (events[:, 0] >= legacy_cutoffs[events[:, 3].astype(int)])]
+    extra_tp = int(np.sum(extras[:, 2] == 0))
     choices, support = policies(events, gt, retention=args.retention)
     per_bag = {}
     for index, info in enumerate(infos):
@@ -249,6 +256,8 @@ def main():
         range_m=dict(zip(CLASSES, (48, 48, 48, 48, 36, 42))),
         decoder='Existing single-label quality-weighted score + class-wise rotated BEV NMS IoU 0.5; unchanged',
         retention_target=args.retention, class_support=support, policies=results,
+        legacy_cutoff_rounding=dict(extra_predictions=len(extras), extra_tp=extra_tp,
+                                    extra_fp=len(extras)-extra_tp),
         fixed_policy_matching_sensitivity=sensitivity,
         chronological_70_30_audit=dict(early_frames=len(early), late_frames=len(late), policies=audit),
         caveats=['Validation-tuned; not an unbiased test or an official AP/NDS improvement.',

@@ -1,0 +1,7 @@
+# Tested with the existing Python 3.8 openmmlab environment, torch 2.4/cu121/cuDNN9.
+# Install with --no-deps --target to preserve existing NumPy/protobuf/sympy.
+onnx==1.16.2
+onnxruntime-gpu==1.19.2
+coloredlogs==15.0.1
+humanfriendly==10.0
+flatbuffers==24.3.25
