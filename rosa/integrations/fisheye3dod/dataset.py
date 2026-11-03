@@ -187,6 +187,9 @@ class OfficialFisheye3DODRangeFilter(BaseTransform):
         annotation["gt_labels_3d"] = labels[keep]
         if "instance_inds" in annotation:
             annotation["instance_inds"] = np.asarray(annotation["instance_inds"])[keep]
+        for key in ('gt_bboxes_3d', 'gt_labels_3d', 'instance_inds'):
+            if key in results and key in annotation:
+                results[key] = annotation[key]
         return results
 
 
@@ -220,6 +223,12 @@ class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
             annotation["instance_inds"] = np.asarray(
                 annotation["instance_inds"]
             )[keep]
+        # LoadAnnotations3D has already published these fields at the top
+        # level. The packer reads them, so filtering ann_info alone leaves
+        # out-of-range boxes behind and misaligns the preserved track IDs.
+        for key in ('gt_bboxes_3d', 'gt_labels_3d', 'instance_inds'):
+            if key in results and key in annotation:
+                results[key] = annotation[key]
         return results
 
 

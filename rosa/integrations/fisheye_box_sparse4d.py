@@ -38,9 +38,9 @@ class FisheyeSparseBoxHead(FisheyeSparseRayHead):
 
     The head keeps the real single-frame Sparse4D InstanceBank, full 11-value
     learned anchors, target sampler, losses, and output decoder.  It replaces
-    only the per-stage image observation/refinement path.  Cross-frame cache is
-    rejected by the first V3 experiment so the comparison remains matched to
-    temporal-free corrected C0.
+    only the per-stage image observation/refinement path. Temporal query
+    seeding is opt-in for V4 through TemporalInstanceBank; the original arms
+    retain their temporal-free contract.
     """
 
     def __init__(
@@ -62,6 +62,7 @@ class FisheyeSparseBoxHead(FisheyeSparseRayHead):
         inference_output_decoder_index: int = -1,
         inference_classification_decoder_index: int | None = None,
         inference_quality_decoder_index: int | None = None,
+        temporal_enabled: bool = False,
         init_cfg: dict | None = None,
     ) -> None:
         # Bypass the V2 constructor, which deliberately deletes InstanceBank.
@@ -122,12 +123,17 @@ class FisheyeSparseBoxHead(FisheyeSparseRayHead):
         )
 
         self.instance_bank = MODELS.build(instance_bank)
+        self.temporal_enabled = bool(temporal_enabled)
         if self.instance_bank.num_anchor != config.num_queries:
             raise ValueError(
                 "InstanceBank anchor count must match decoder query budget"
             )
-        if self.instance_bank.num_temp_instances != 0:
+        if self.instance_bank.num_temp_instances != 0 and not self.temporal_enabled:
             raise ValueError("the matched fisheye box arm requires temporal slots=0")
+        if self.temporal_enabled and (
+                not self.use_hybrid_v4 or self.instance_bank.num_temp_instances <= 0 or
+                type(self.instance_bank).__name__ != 'TemporalInstanceBank'):
+            raise ValueError('Temporal V4 requires TemporalInstanceBank with positive memory slots')
         self.sampler = TASK_UTILS.build(sampler)
         self.decoder = TASK_UTILS.build(decoder)
         self.loss_cls = MODELS.build(loss_cls)
@@ -251,7 +257,7 @@ class FisheyeSparseBoxHead(FisheyeSparseRayHead):
             temp_anchor,
             _time_interval,
         ) = self.instance_bank.get(batch_size, metas)
-        if temp_feature is not None or temp_anchor is not None:
+        if not self.temporal_enabled and (temp_feature is not None or temp_anchor is not None):
             raise RuntimeError("temporal-free fisheye box head received a cache")
         instance_feature, anchor, attention_mask, dn = self._append_dn_queries(
             instance_feature,
@@ -291,6 +297,13 @@ class FisheyeSparseBoxHead(FisheyeSparseRayHead):
                 value[:, :num_free].detach() for value in output.level_compatibility
             ],
         }
+        if self.temporal_enabled:
+            result['temporal_valid'] = self.instance_bank.valid_slots.detach().clone()
+            self.instance_bank.cache(
+                output.query[:, :num_free],
+                output.states[-1].to_sparse_anchor()[:, :num_free],
+                output.classification[-1][:, :num_free], metas,
+                quality=output.quality[-1][:, :num_free])
         if self.use_hybrid_v4:
             result.update(
                 {
@@ -341,6 +354,12 @@ class FisheyeSparseBoxHead(FisheyeSparseRayHead):
                 }
             )
         return result
+
+    def loss(self, model_outs, data, feature_maps=None):
+        losses = super().loss(model_outs, data, feature_maps)
+        if self.temporal_enabled:
+            losses['temporal_cache_fraction'] = model_outs['temporal_valid'].float().mean()
+        return losses
 
     @staticmethod
     def _slice_hybrid_state(state: HybridBoxState, end: int) -> HybridBoxState:
