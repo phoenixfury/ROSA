@@ -72,6 +72,7 @@ def main():
     parser.add_argument('--config', type=Path, default=ROSA / 'configs/fisheye3dod/rosa_vov99_singleframe_refresh_24e.py')
     parser.add_argument('--data-root', type=Path, default=ROOT / 'data/Custom/combined_improved_detzero_rosa')
     parser.add_argument('--output-dir', type=Path, default=ROSA / 'work_dirs/onnx_singleframe_e1')
+    parser.add_argument('--model-name', default='rosa_e1', help='Output ONNX basename, without extension')
     parser.add_argument('--example-indices', type=int, nargs='+', default=[0, 200, 400])
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--force', action='store_true', help='Explicitly overwrite an existing generated ONNX model')
@@ -86,7 +87,9 @@ def main():
 
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    destination = args.output_dir / 'rosa_e1.onnx'
+    if not args.model_name or Path(args.model_name).name != args.model_name:
+        parser.error('--model-name must be a basename without directories')
+    destination = args.output_dir / (args.model_name + '.onnx')
     if destination.exists() and not args.force and not args.prepare_only and not args.references_only:
         raise FileExistsError(f'{destination}: use a new output directory or --force')
     if args.references_only:

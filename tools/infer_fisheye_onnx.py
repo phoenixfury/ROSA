@@ -14,12 +14,17 @@ if sys.version_info[:2] == (3, 8) and LOCAL_DEPS.is_dir():
     sys.path.insert(0, str(LOCAL_DEPS))
 
 from deployment.runtime import (CAMERAS, CLASSES, COORDINATES, compare_outputs,
-    create_session, image_input, load_npz, postprocess)
+    create_session, image_input, load_npz, postprocess, prepared_samples)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=Path, required=True)
+    parser.add_argument('--engine', type=Path, help='Optional checked TensorRT engine compiled from this ONNX model')
+    parser.add_argument('--split-encoder', type=Path, help='Exact encoder/head partition directory')
+    parser.add_argument('--encoder-engine', type=Path, help='Optional TensorRT encoder; the ONNX head stays FP32')
+    parser.add_argument('--iobinding', action='store_true', help='Persistent GPU I/O buffers for ORT CUDA')
+    parser.add_argument('--cuda-graph', action='store_true', help='CUDA graph replay; requires --iobinding and a fully CUDA model')
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--input', type=Path, help='Exporter-generated complete input .npz')
     source.add_argument('--images', nargs=4, type=Path, metavar=('FRONT', 'LEFT', 'RIGHT', 'REAR'))
@@ -28,6 +33,9 @@ def main():
     parser.add_argument('--data-root', type=Path, help='Relocate the dataset used by --samples, e.g. on the server')
     parser.add_argument('--provider', choices=('cuda', 'cpu'), default='cuda')
     parser.add_argument('--threads', type=int, default=2)
+    parser.add_argument('--custom-op-library', type=Path)
+    parser.add_argument('--cuda-tuning', choices=('default', 'throughput'), default='default',
+                        help='Throughput: one-time cuDNN autotuning and larger convolution workspace; TF32 remains disabled')
     thresholds = parser.add_mutually_exclusive_group()
     thresholds.add_argument('--score-threshold', type=float, default=.1)
     thresholds.add_argument('--threshold-profile', type=Path,
@@ -37,15 +45,25 @@ def main():
     parser.add_argument('--box-origin', choices=('gravity_center', 'bottom_center'), default='gravity_center')
     parser.add_argument('--start-frame', type=int, default=0)
     parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--warmup', type=int, default=0, help='Untimed first-sample warmups; default preserves every-frame timing')
     parser.add_argument('--reference', type=Path, help='Compare one input to the exporter PyTorch .npz reference')
     parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--prefetch', action='store_true',
+                        help='Overlap one next-frame JPEG/calibration load with GPU inference; session calls stay sequential')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.custom_op_library and args.engine:
+        parser.error('The ROSA ORT custom-op library is not a TensorRT engine plugin')
+    if args.cuda_graph and ((not args.iobinding and not args.split_encoder) or args.provider!='cuda' or args.engine):
+        parser.error('--cuda-graph requires ORT CUDA --iobinding or --split-encoder')
+    if args.encoder_engine and not args.split_encoder:parser.error('--encoder-engine requires --split-encoder')
+    if args.split_encoder and (args.iobinding or args.engine or args.provider!='cuda' or args.profile):
+        parser.error('Split encoder requires CUDA and handles its own GPU I/O; full-engine/profile options do not apply')
     if args.images and args.calibration is None:
         parser.error('--images requires --calibration from the export bundle')
     if args.reference and not args.input:
         parser.error('--reference requires a single --input')
-    if args.start_frame < 0 or (args.max_frames is not None and args.max_frames < 1):
+    if args.start_frame < 0 or args.warmup < 0 or (args.max_frames is not None and args.max_frames < 1):
         parser.error('Invalid frame interval')
     manifest_path = args.model.with_suffix('.json')
     manifest = json.loads(manifest_path.read_text())
@@ -85,10 +103,33 @@ def main():
     samples = samples[args.start_frame:stop]
     if not samples:
         parser.error('No selected samples')
-    session = create_session(args.model, args.provider, args.threads, args.profile)
+    if args.split_encoder:
+        from deployment.split_runtime import SplitEncoderRunner
+        session=SplitEncoderRunner(args.model,args.split_encoder,args.encoder_engine,args.threads,
+            args.cuda_graph,args.cuda_tuning,args.custom_op_library)
+    elif args.engine:
+        if args.profile or args.provider!='cuda' or args.iobinding:
+            parser.error('TensorRT requires CUDA; ORT profiling/I/O-binding flags do not apply')
+        from deployment.tensorrt_runtime import TensorRTRunner
+        engine_metadata=json.loads((args.engine.parent/'build_report.json').read_text())
+        if engine_metadata['onnx_sha256']!=manifest['onnx_sha256']:
+            parser.error('TensorRT engine belongs to a different ONNX model')
+        if hashlib.sha256(args.engine.read_bytes()).hexdigest()!=engine_metadata['engine_sha256']:
+            parser.error('TensorRT engine checksum differs from build report')
+        session=TensorRTRunner(args.engine)
+    else:
+        session = create_session(args.model, args.provider, args.threads, args.profile,
+                                 cuda_tuning=args.cuda_tuning,cuda_graph=args.cuda_graph,
+                                 custom_op_library=args.custom_op_library)
+    bound=None
+    if args.iobinding:
+        if args.provider!='cuda':
+            parser.error('--iobinding requires CUDA')
+        from deployment.runtime import CudaIOBindingRunner
+        bound=CudaIOBindingRunner(session,cuda_graph=args.cuda_graph)
     expected = {item.name: item for item in session.get_inputs()}
-    frames, timings, comparison = [], [], None
-    for index, sample in enumerate(samples):
+    frames, timings, decode_timings, wait_timings, postprocess_timings, comparison = [], [], [], [], [], None
+    def load_feed(sample):
         if 'input' in sample:
             feed = load_npz(sample['input'])
         else:
@@ -102,15 +143,28 @@ def main():
         for key, value in feed.items():
             if list(value.shape) != expected[key].shape:
                 raise ValueError(f'{key}: shape {value.shape} differs from {expected[key].shape}')
+        return feed
+    for index, (sample, feed, decode_seconds, wait_seconds) in enumerate(prepared_samples(samples, load_feed, args.prefetch)):
+        decode_timings.append(decode_seconds)
+        wait_timings.append(wait_seconds)
+        if index==0 and args.warmup:
+            warmup_timings=[]
+            for _ in range(args.warmup):
+                warmup_started=time.perf_counter()
+                if bound is not None:bound.run(feed)
+                else:session.run(None,feed)
+                warmup_timings.append(time.perf_counter()-warmup_started)
         started = time.perf_counter()
-        raw = session.run(None, feed)
+        raw = bound.run(feed) if bound is not None else session.run(None, feed)
         timings.append(time.perf_counter() - started)
         if args.reference:
             comparison = compare_outputs(raw, load_npz(args.reference))
             print('PyTorch parity:', json.dumps(comparison), flush=True)
+        postprocess_started = time.perf_counter()
         prediction = postprocess(*raw, score_threshold=args.score_threshold,
             nms_iou=args.nms_iou, max_distance=args.max_distance, origin=args.box_origin,
             class_score_thresholds=class_thresholds)
+        postprocess_timings.append(time.perf_counter() - postprocess_started)
         frames.append(dict(index=args.start_frame+index, token=str(sample['token']), **prediction))
         print(f'{index+1}/{len(samples)} | boxes={len(prediction["scores"])} | '
               f'network={timings[-1]:.3f}s | {sample["token"]}', flush=True)
@@ -120,7 +174,23 @@ def main():
         score_threshold=None if class_thresholds is not None else args.score_threshold,
         class_score_thresholds=class_thresholds,
         nms_iou=args.nms_iou, max_distance=args.max_distance, frames=frames,
-        providers=session.get_providers(), seconds_per_frame=timings, pytorch_parity=comparison)
+        providers=session.get_providers(), seconds_per_frame=timings, pytorch_parity=comparison,
+        iobinding=args.iobinding,cuda_graph=args.cuda_graph,cuda_tuning=args.cuda_tuning,threads=args.threads,
+        custom_ops=manifest.get('custom_ops'),
+        decode_seconds_per_frame=decode_timings,postprocess_seconds_per_frame=postprocess_timings,
+        prefetch=args.prefetch,input_wait_seconds_per_frame=wait_timings,
+        serial_work_seconds_per_frame=[a+b+c for a,b,c in zip(decode_timings,timings,postprocess_timings)],
+        end_to_end_seconds_per_frame=[a+b+c for a,b,c in zip(wait_timings,timings,postprocess_timings)],
+        timing_note='End-to-end adds consumer input wait, network and postprocess. With prefetch, JPEG decode may overlap previous inference; serial_work is not the effective pipeline latency. Logging, rendering and cold initialization excluded.')
+    if args.warmup:payload['warmup_seconds']=warmup_timings
+    if args.engine:
+        payload.update(engine=str(args.engine.resolve()),engine_sha256=engine_metadata['engine_sha256'],
+            engine_precision=engine_metadata['precision'],tensorrt_version=engine_metadata['tensorrt_version'])
+    if args.split_encoder:
+        payload.update(split_encoder=str(args.split_encoder.resolve()),
+            encoder_precision=session.encoder_precision,
+            encoder_engine=str(args.encoder_engine.resolve()) if args.encoder_engine else None,
+            encoder_engine_sha256=hashlib.sha256(args.encoder_engine.read_bytes()).hexdigest() if args.encoder_engine else None)
     if args.profile:
         payload['onnxruntime_profile'] = session.end_profiling()
     args.output.parent.mkdir(parents=True, exist_ok=True)

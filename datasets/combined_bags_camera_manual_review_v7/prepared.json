@@ -1,0 +1,45 @@
+{
+  "anchors": "TRAIN centers only; MiniBatchKMeans300, seed3407, n_init3, batch4096, max_iter100",
+  "annotations": "All GT, track IDs, tokens, ordering, splits and extrinsics unchanged",
+  "conversion": "OpenCV-fisheye native rays -> canonical 800x800 OCam, FOV220; bilinear; black invalid",
+  "counts": {
+    "train": {
+      "classes": {
+        "Bus": 315,
+        "Car": 102272,
+        "Cyclist": 122,
+        "Pedestrian": 3567,
+        "Truck": 2026,
+        "Van": 1529
+      },
+      "frames": 9959
+    },
+    "val": {
+      "classes": {
+        "Bus": 23,
+        "Car": 8642,
+        "Cyclist": 2,
+        "Pedestrian": 342,
+        "Truck": 115,
+        "Van": 171
+      },
+      "frames": 1034
+    }
+  },
+  "images": 43972,
+  "jpeg_quality": 95,
+  "outputs": {
+    "calib_results.txt": "2b40a1c04dd77bdb78bb0bccae959ba64983516d4217a85692821c86046e43a4",
+    "calibration_baselink.json": "3c26fe85192a37eb982f6911e7a768da039f04f7c161d0b6c08f3508c6acd9e3",
+    "canonical_remaps.npz": "83243698e52a4ab6d75c84feacc17132e0852b808b86b4ea65a8e0d90c6a9a4f",
+    "image_jobs.json": "27ab6714366b47be0ad44d25aa2aaaf7562c23e30520e9961f1e0bc6495c41d4",
+    "rosa/anchors/train_centers300_seed3407.npy": "729ee078de289555d39854c35a94e6118bea13e4616167339600990e6f3c5afc",
+    "rosa/fisheye3dod_infos_train.pkl": "3c782d50cece14ffc2a39f7675a7e805edb978c0a6e25206db1c2f6e9ef8879e",
+    "rosa/fisheye3dod_infos_val.pkl": "307cbe8bc7239c5eac8e5a2a0e4685c5cdb82dcbc911995db51ed0d3b95be1aa"
+  },
+  "sources": {
+    "fisheye3dod_infos_train.pkl": "4fc1cac224ba5bc5e663f3a2cfe072c29c9be1a548d94ea8bdc31851288da3c6",
+    "fisheye3dod_infos_val.pkl": "2b7593f804550516c86fd4262a49a90159379a11cf83e886aa20ffbde27732e8"
+  },
+  "version": 1
+}
